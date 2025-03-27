@@ -112,4 +112,107 @@ class Args:
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
 
-    # 155
+    output_dir: str = "models./ppo_tldr_pythia_1_4b"
+    lora_alpha: int = 2048
+    lora_dropout: float = 0.0
+    task: TaskHParams = field(default_factory=TaskHParams)
+    reward: RewardHParams = field(default_factory=RewardHParams)
+    ppo: PpoHparams = field(default_factory=PpoHParams)
+
+    def configure_dropout(model_config, dropout_layer_keys, dropout):
+        if dropout is not None:
+            for key in dropout_layer_keys:
+                if hasattr(model_config, key):
+                    print(f"Setting model_config.{key} to {dropout}")
+                    setattr(model_config, key, dropout)
+
+    
+    def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
+        table = Table(show_lines = True)
+        for column is df.columns:
+            table.add_column(column)
+        for _, row in df.iterrows():
+            table.add_row(*row.astype(str).tolist())
+        
+        console.rule(f"[bold red] {title}")
+        console.print(table)
+
+    def layer_init(layer, std=np.sqrt(2), bias_const=0.0)
+        torch.nn.init.normal_(layer.weight, std=std)
+        torch.nn.init.constant_(layer.bias, val=bias_const)
+        return layer
+    
+    class AdaptiveKLController:
+        def __init__(self, init_kl_coef: float, hparams: AdaptiveKLParams):
+            self.value = init_kl_coef
+            self.hparams = hparams
+
+        def update(self, current, n_steps):
+            target = self.hparams.target
+            proportional_error = np.clip(current / target -1, -0.2, 0.2)
+            mult = 1 + proportional_error * n_steps / self.hparams.horizon
+            self.value *= mult
+
+        def whiten(values, shift_mean=True):
+            
+            mean, var = torch.mean(values), torch.var(values, unbiased=False)
+            whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+            if not shift_mean:
+                whitened += mean
+            
+            return whitened
+        
+        class ScalarModelConfig(PretrainedConfig):
+            def __init__(
+                    self,
+                    base_model: str = "EleutherAI/pythia-160m",
+                    base_config: PretrainedConfig = AutoConfig.from_pretrained("EleutherAI/pythia-160m"),
+                    hidden_size: int = 768,
+                    bias: float = 0.0,
+                    **kwargs,
+            ):
+                super().__init__(**kwargs)
+                self.base_model = base_model
+                self.base_config = base_config
+                self.hidden_size = hidden_size
+                self.bias = bias
+
+        class ScalarModel(PreTrainedModel):
+            config_class = ScalarModelConfig
+
+            def __init__(self, config: ScalarModelConfig):
+                super().__init__(config)
+                self.config = config
+                self.lm_backbone = AutoModel.from_pretrained(
+                    config.base_model,
+                    config=self.config.base_config,
+                    trust_remote_code=True,
+                )
+                self.scalar_head = layer_init(
+                    nn.Linear(self.config.hidden_size, 1),
+                    std = 1 / np.sqrt(self.config.hidden_size + 1)
+                )
+            
+            def forward(self, **kwargs):
+                output = self.lm_backbone(**kwargs)
+                reward = self.scalar_head(output.last_hidden_state[-1]) - self.config.bias
+                return reward
+            
+            def get_reward(model, query_responses, tokenizer, context_length):
+                attention_mask = query_response != tokenizer.pad_token_id
+                input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+                reward_logits = model(
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    return_dict = True,
+                    output_hidden_states = True,
+                )
+                sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
+
+                return (
+                    reward_logits,
+                    reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lenghts].squeeze(-1),
+                    sequence_lengths,
+                )
+            
+# 274
